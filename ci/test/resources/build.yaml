@@ -1,0 +1,208 @@
+steps:
+ - kind: createNamespace
+   name: default_ns
+   namespaceName: default
+   public: true
+ - kind: buildImage
+   name: git_image
+   dockerFile:
+     inline: |
+       FROM ubuntu:18.04
+       RUN apt-get update && apt-get install -y git
+   contextPath: .
+ - kind: runImage
+   name: create_git_repo
+   image:
+     valueFrom:
+       git_image.image
+   script: |
+     set -ex
+
+     cd /io
+     mkdir foo
+     cd foo
+     git config --global user.email "you@example.com"
+     git config --global user.name "Your Name"
+     git init
+
+     cat >Dockerfile <<EOF
+     FROM ubuntu:18.04
+     COPY uncompressed-file .
+     COPY archived-foo/foo/data data1
+     COPY recursive-foo/foo/data data2
+     RUN diff data1 data2
+     EOF
+
+     cat >data <<EOF
+     some data
+     EOF
+
+     git add Dockerfile
+     git commit -m "first commit"
+
+     cd ..
+
+     cat >uncompressed-file <<EOF
+     this is an uncompressed file
+     EOF
+     # without a newline after EOF bash things the heredoc is unterminated
+   outputs:
+     - from: /io/foo
+       to: /foo.tgz
+       directory: archive
+     - from: /io/foo
+       to: /foo
+       directory: recursive
+     - from: /io/uncompressed-file
+       to: /uncompressed-file
+   dependsOn:
+     - git_image
+ - kind: buildImage
+   name: verify_copy_inputs_for_build_image_works
+   dockerFile: /recursive-foo/Dockerfile
+   contextPath: .
+   inputs:
+     - from: /foo.tgz
+       to: /archived-foo
+       directory: archive
+       extract:
+         - foo/data
+     - from: /foo
+       to: /recursive-foo
+       directory: recursive
+     - from: /uncompressed-file
+       to: /uncompressed-file
+   image:
+     valueFrom:
+       git_image.image
+   dependsOn:
+     - git_image
+     - create_git_repo
+ - kind: runImage
+   name: verify_copy_inputs_for_run_image_works
+   image: ubuntu:18.04
+   script: |
+     cd io
+     diff archived-foo/data recursive-foo/data
+     cat uncompressed-file
+   inputs:
+     - from: /foo.tgz
+       to: /io/archived-foo
+       directory: archive
+       extract:
+         - foo/data
+     - from: /foo
+       to: /io/recursive-foo
+       directory: recursive
+     - from: /uncompressed-file
+       to: /io/uncompressed-file
+ - kind: buildImage
+   name: base_image
+   dockerFile: docker/Dockerfile.base
+   contextPath: .
+   publishAs: base
+ - kind: buildImage
+   name: service_base_image
+   dockerFile: docker/Dockerfile.service-base
+   contextPath: .
+   publishAs: service-base
+   dependsOn:
+    - base_image
+ - kind: buildImage
+   name: hello_image
+   dockerFile: ci/test/resources/Dockerfile
+   contextPath: .
+   publishAs: ci-hello
+   dependsOn:
+    - service_base_image
+ - kind: runImage
+   name: check_hello
+   image:
+     valueFrom: hello_image.image
+   script: |
+     set -ex
+     python3 -m flake8 /hello/hello.py
+   dependsOn:
+     - hello_image
+ - kind: createDatabase
+   name: hello_database
+   databaseName: hello
+   namespace:
+     valueFrom: default_ns.name
+   dependsOn:
+    - default_ns
+ - kind: runImage
+   name: checkout_this_repo
+   image:
+     valueFrom: git_image.image
+   script: |
+     set -ex
+     cd /io
+     mkdir repo
+     cd repo
+     {{ code.checkout_script }}
+   outputs:
+    - from: /io/repo
+      to: /repo
+      directory: archive
+   dependsOn:
+     - git_image
+ - kind: createDatabase2
+   name: hello2_database
+   databaseName: hello2
+   migrations:
+    - name: create-tables
+      script: /io/sql/create-hello2-tables.sql
+    - name: insert
+      script: /io/sql/insert.py
+   inputs:
+    - from: /repo
+      to: /io/
+      directory: archive
+      extract:
+        - ci/test/resources/sql
+   namespace:
+     valueFrom: default_ns.name
+   dependsOn:
+    - default_ns
+    - checkout_this_repo
+ - kind: runImage
+   name: test_hello2_database
+   image:
+     valueFrom: service_base_image.image
+   script: |
+     cat > test.py <<EOF
+     import asyncio
+     from gear import Database
+     async def async_main():
+       db = Database()
+       await db.async_init()
+       row = await db.execute_and_fetchone('SELECT version FROM hello2_migration_version;')
+       assert row['version'] == 3
+     asyncio.get_event_loop().run_until_complete(async_main())
+     EOF
+     python3 test.py
+   secrets:
+    - name:
+        valueFrom: hello2_database.user_secret_name
+      namespace:
+        valueFrom: default_ns.name
+      mountPath: /sql-config
+   dependsOn:
+    - default_ns
+    - hello2_database
+    - service_base_image
+ - kind: deploy
+   name: deploy_hello
+   namespace:
+     valueFrom: default_ns.name
+   config: ci/test/resources/deployment.yaml
+   wait:
+    - kind: Service
+      name: hello
+      for: alive
+   dependsOn:
+    - default_ns
+    - hello_image
+    - check_hello
+    - hello_database
